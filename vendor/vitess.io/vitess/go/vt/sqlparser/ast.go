@@ -403,7 +403,6 @@ func (node *Select) AddWhere(expr Expr) {
 		Left:  node.Where.Expr,
 		Right: expr,
 	}
-	return
 }
 
 // AddHaving adds the boolean expression to the
@@ -426,7 +425,6 @@ func (node *Select) AddHaving(expr Expr) {
 		Left:  node.Having.Expr,
 		Right: expr,
 	}
-	return
 }
 
 // ParenSelect is a parenthesized SELECT statement.
@@ -534,7 +532,7 @@ func (node *Stream) walkSubtree(visit Visit) error {
 // the row and re-inserts with new values. For that reason we keep it as an Insert struct.
 // Replaces are currently disallowed in sharded schemas because
 // of the implications the deletion part may have on vindexes.
-// If you add fields here, consider adding them to calls to validateSubquerySamePlan.
+// If you add fields here, consider adding them to calls to validateUnshardedRoute.
 type Insert struct {
 	Action     string
 	Comments   Comments
@@ -586,7 +584,7 @@ func (Values) iInsertRows()       {}
 func (*ParenSelect) iInsertRows() {}
 
 // Update represents an UPDATE statement.
-// If you add fields here, consider adding them to calls to validateSubquerySamePlan.
+// If you add fields here, consider adding them to calls to validateUnshardedRoute.
 type Update struct {
 	Comments   Comments
 	Ignore     string
@@ -620,7 +618,7 @@ func (node *Update) walkSubtree(visit Visit) error {
 }
 
 // Delete represents a DELETE statement.
-// If you add fields here, consider adding them to calls to validateSubquerySamePlan.
+// If you add fields here, consider adding them to calls to validateUnshardedRoute.
 type Delete struct {
 	Comments   Comments
 	Targets    TableNames
@@ -664,9 +662,10 @@ type Set struct {
 
 // Set.Scope or Show.Scope
 const (
-	SessionStr  = "session"
-	GlobalStr   = "global"
-	ImplicitStr = ""
+	SessionStr        = "session"
+	GlobalStr         = "global"
+	VitessMetadataStr = "vitess_metadata"
+	ImplicitStr       = ""
 )
 
 // Format formats the node.
@@ -741,6 +740,9 @@ type DDL struct {
 
 	// VindexCols is set for AddColVindexStr.
 	VindexCols []ColIdent
+
+	// AutoIncSpec is set for AddAutoIncStr.
+	AutoIncSpec *AutoIncSpec
 }
 
 // DDL strings.
@@ -757,6 +759,8 @@ const (
 	DropVschemaTableStr = "drop vschema table"
 	AddColVindexStr     = "on table add vindex"
 	DropColVindexStr    = "on table drop vindex"
+	AddSequenceStr      = "add sequence"
+	AddAutoIncStr       = "add auto_increment"
 
 	// Vindex DDL param to specify the owner of a vindex
 	VindexOwnerStr = "owner"
@@ -793,9 +797,9 @@ func (node *DDL) Format(buf *TrackedBuffer) {
 	case FlushStr:
 		buf.Myprintf("%s", node.Action)
 	case CreateVindexStr:
-		buf.Myprintf("alter vschema create vindex %v %v", node.VindexSpec.Name, node.VindexSpec)
+		buf.Myprintf("alter vschema create vindex %v %v", node.Table, node.VindexSpec)
 	case DropVindexStr:
-		buf.Myprintf("alter vschema drop vindex %v", node.VindexSpec.Name)
+		buf.Myprintf("alter vschema drop vindex %v", node.Table)
 	case AddVschemaTableStr:
 		buf.Myprintf("alter vschema add table %v", node.Table)
 	case DropVschemaTableStr:
@@ -815,6 +819,10 @@ func (node *DDL) Format(buf *TrackedBuffer) {
 		}
 	case DropColVindexStr:
 		buf.Myprintf("alter vschema on %v drop vindex %v", node.Table, node.VindexSpec.Name)
+	case AddSequenceStr:
+		buf.Myprintf("alter vschema add sequence %v", node.Table)
+	case AddAutoIncStr:
+		buf.Myprintf("alter vschema on %v add auto_increment %v", node.Table, node.AutoIncSpec)
 	default:
 		buf.Myprintf("%s table %v", node.Action, node.Table)
 	}
@@ -1354,6 +1362,23 @@ type VindexSpec struct {
 	Params []VindexParam
 }
 
+// AutoIncSpec defines and autoincrement value for a ADD AUTO_INCREMENT statement
+type AutoIncSpec struct {
+	Column   ColIdent
+	Sequence TableName
+}
+
+// Format formats the node.
+func (node *AutoIncSpec) Format(buf *TrackedBuffer) {
+	buf.Myprintf("%v ", node.Column)
+	buf.Myprintf("using %v", node.Sequence)
+}
+
+func (node *AutoIncSpec) walkSubtree(visit Visit) error {
+	err := Walk(visit, node.Sequence, node.Column)
+	return err
+}
+
 // ParseParams parses the vindex parameter list, pulling out the special-case
 // "owner" parameter
 func (node *VindexSpec) ParseParams() (string, map[string]string) {
@@ -1519,6 +1544,7 @@ func (f *ForeignKeyDefinition) walkSubtree(visit Visit) error {
 type Show struct {
 	Type                   string
 	OnTable                TableName
+	Table                  TableName
 	ShowTablesOpt          *ShowTablesOpt
 	Scope                  string
 	ShowCollationFilterOpt *Expr
@@ -1549,11 +1575,20 @@ func (node *Show) Format(buf *TrackedBuffer) {
 	if node.Type == "collation" && node.ShowCollationFilterOpt != nil {
 		buf.Myprintf(" where %v", *node.ShowCollationFilterOpt)
 	}
+	if node.HasTable() {
+		buf.Myprintf(" %v", node.Table)
+	}
 }
 
 // HasOnTable returns true if the show statement has an "on" clause
 func (node *Show) HasOnTable() bool {
 	return node.OnTable.Name.v != ""
+}
+
+// HasTable returns true if the show statement has a parsed table name.
+// Not all show statements parse table names.
+func (node *Show) HasTable() bool {
+	return node.Table.Name.v != ""
 }
 
 func (node *Show) walkSubtree(visit Visit) error {
@@ -1972,7 +2007,7 @@ func (node TableName) walkSubtree(visit Visit) error {
 
 // IsEmpty returns true if TableName is nil or empty.
 func (node TableName) IsEmpty() bool {
-	// If Name is empty, Qualifer is also empty.
+	// If Name is empty, Qualifier is also empty.
 	return node.Name.IsEmpty()
 }
 

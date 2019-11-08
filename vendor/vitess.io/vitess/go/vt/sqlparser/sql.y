@@ -158,12 +158,13 @@ func skipToEnd(yylex interface{}) {
 
 // DDL Tokens
 %token <bytes> CREATE ALTER DROP RENAME ANALYZE ADD FLUSH
-%token <bytes> SCHEMA TABLE INDEX VIEW TO IGNORE IF UNIQUE PRIMARY COLUMN  SPATIAL FULLTEXT KEY_BLOCK_SIZE
+%token <bytes> SCHEMA TABLE INDEX VIEW TO IGNORE IF UNIQUE PRIMARY COLUMN SPATIAL FULLTEXT KEY_BLOCK_SIZE CHECK
 %token <bytes> ACTION CASCADE CONSTRAINT FOREIGN NO REFERENCES RESTRICT
 %token <bytes> SHOW DESCRIBE EXPLAIN DATE ESCAPE REPAIR OPTIMIZE TRUNCATE
 %token <bytes> MAXVALUE PARTITION REORGANIZE LESS THAN PROCEDURE TRIGGER
 %token <bytes> VINDEX VINDEXES
 %token <bytes> STATUS VARIABLES WARNINGS
+%token <bytes> SEQUENCE
 
 // Transaction Tokens
 %token <bytes> BEGIN START TRANSACTION COMMIT ROLLBACK
@@ -181,7 +182,7 @@ func skipToEnd(yylex interface{}) {
 %token <bytes> NULLX AUTO_INCREMENT APPROXNUM SIGNED UNSIGNED ZEROFILL
 
 // Supported SHOW tokens
-%token <bytes> COLLATION DATABASES TABLES VITESS_KEYSPACES VITESS_SHARDS VITESS_TABLETS VSCHEMA VSCHEMA_TABLES VITESS_TARGET FULL PROCESSLIST COLUMNS FIELDS ENGINES PLUGINS
+%token <bytes> COLLATION DATABASES TABLES VITESS_METADATA VSCHEMA FULL PROCESSLIST COLUMNS FIELDS ENGINES PLUGINS
 
 // SET tokens
 %token <bytes> NAMES CHARSET GLOBAL SESSION ISOLATION LEVEL READ WRITE ONLY REPEATABLE COMMITTED UNCOMMITTED SERIALIZABLE
@@ -219,9 +220,9 @@ func skipToEnd(yylex interface{}) {
 %type <tableExprs> from_opt table_references
 %type <tableExpr> table_reference table_factor join_table
 %type <joinCondition> join_condition join_condition_opt on_expression_opt
-%type <tableNames> table_name_list
+%type <tableNames> table_name_list delete_table_list
 %type <str> inner_join outer_join straight_join natural_join
-%type <tableName> table_name into_table_name
+%type <tableName> table_name into_table_name delete_table_name
 %type <aliasedTableName> aliased_table_name
 %type <indexHints> index_hint_list
 %type <expr> where_expression_opt
@@ -261,7 +262,7 @@ func skipToEnd(yylex interface{}) {
 %type <bytes> for_from
 %type <str> ignore_opt default_opt
 %type <str> full_opt from_database_opt tables_or_processlist columns_or_fields
-%type <showFilter> like_or_where_opt
+%type <showFilter> like_or_where_opt like_opt
 %type <byt> exists_opt
 %type <empty> not_exists_opt non_add_drop_or_rename_operation to_opt index_opt constraint_opt
 %type <bytes> reserved_keyword non_reserved_keyword
@@ -454,6 +455,10 @@ delete_statement:
   {
     $$ = &Delete{Comments: Comments($2), Targets: $3, TableExprs: $5, Where: NewWhere(WhereStr, $6)}
   }
+|DELETE comment_opt delete_table_list from_or_using table_references where_expression_opt
+  {
+    $$ = &Delete{Comments: Comments($2), Targets: $3, TableExprs: $5, Where: NewWhere(WhereStr, $6)}
+  }
 
 from_or_using:
   FROM {}
@@ -465,6 +470,16 @@ table_name_list:
     $$ = TableNames{$1}
   }
 | table_name_list ',' table_name
+  {
+    $$ = append($$, $3)
+  }
+
+delete_table_list:
+  delete_table_name
+  {
+    $$ = TableNames{$1}
+  }
+| delete_table_list ',' delete_table_name
   {
     $$ = append($$, $3)
   }
@@ -1293,19 +1308,27 @@ alter_statement:
   {
     $$ = &DDL{Action: AlterStr, Table: $4, PartitionSpec: $5}
   }
-| ALTER VSCHEMA CREATE VINDEX sql_id vindex_type_opt vindex_params_opt
+| ALTER VSCHEMA CREATE VINDEX table_name vindex_type_opt vindex_params_opt
   {
-    $$ = &DDL{Action: CreateVindexStr, VindexSpec: &VindexSpec{
-        Name: $5,
-        Type: $6,
-        Params: $7,
-    }}
+    $$ = &DDL{
+        Action: CreateVindexStr,
+        Table: $5,
+        VindexSpec: &VindexSpec{
+          Name: NewColIdent($5.Name.String()),
+          Type: $6,
+          Params: $7,
+        },
+      }
   }
-| ALTER VSCHEMA DROP VINDEX sql_id
+| ALTER VSCHEMA DROP VINDEX table_name
   {
-    $$ = &DDL{Action: DropVindexStr, VindexSpec: &VindexSpec{
-        Name: $5,
-    }}
+    $$ = &DDL{
+        Action: DropVindexStr,
+        Table: $5,
+        VindexSpec: &VindexSpec{
+          Name: NewColIdent($5.Name.String()),
+        },
+      }
   }
 | ALTER VSCHEMA ADD TABLE table_name
   {
@@ -1338,9 +1361,25 @@ alter_statement:
         },
       }
   }
+| ALTER VSCHEMA ADD SEQUENCE table_name
+  {
+    $$ = &DDL{Action: AddSequenceStr, Table: $5}
+  }
+| ALTER VSCHEMA ON table_name ADD AUTO_INCREMENT sql_id USING table_name
+  {
+    $$ = &DDL{
+        Action: AddAutoIncStr,
+        Table: $4,
+        AutoIncSpec: &AutoIncSpec{
+            Column: $7,
+            Sequence: $9,
+        },
+    }
+  }
 
 alter_object_type:
-  COLUMN
+  CHECK
+| COLUMN
 | CONSTRAINT
 | FOREIGN
 | FULLTEXT
@@ -1469,9 +1508,9 @@ show_statement:
   {
     $$ = &Show{Type: string($2) + " " + string($3)}
   }
-| SHOW CREATE TABLE ddl_skip_to_end
+| SHOW CREATE TABLE table_name
   {
-    $$ = &Show{Type: string($2) + " " + string($3)}
+    $$ = &Show{Type: string($2) + " " + string($3), Table: $4}
   }
 | SHOW CREATE TRIGGER ddl_skip_to_end
   {
@@ -1542,21 +1581,10 @@ show_statement:
     showCollationFilterOpt := $4
     $$ = &Show{Type: string($2), ShowCollationFilterOpt: &showCollationFilterOpt}
   }
-| SHOW VITESS_KEYSPACES
+| SHOW VITESS_METADATA VARIABLES like_opt
   {
-    $$ = &Show{Type: string($2)}
-  }
-| SHOW VITESS_SHARDS
-  {
-    $$ = &Show{Type: string($2)}
-  }
-| SHOW VITESS_TABLETS
-  {
-    $$ = &Show{Type: string($2)}
-  }
-| SHOW VITESS_TARGET
-  {
-    $$ = &Show{Type: string($2)}
+    showTablesOpt := &ShowTablesOpt{Filter: $4}
+    $$ = &Show{Scope: string($2), Type: string($3), ShowTablesOpt: showTablesOpt}
   }
 | SHOW VSCHEMA TABLES
   {
@@ -1579,6 +1607,10 @@ show_statement:
  *
  *  SHOW BINARY LOGS
  *  SHOW INVALID
+ *  SHOW VITESS_KEYSPACES
+ *  SHOW VITESS_TABLETS
+ *  SHOW VITESS_SHARDS
+ *  SHOW VITESS_TARGET
  */
 | SHOW ID ddl_skip_to_end
   {
@@ -1642,6 +1674,16 @@ like_or_where_opt:
   {
     $$ = &ShowFilter{Filter:$2}
   }
+
+like_opt:
+  /* empty */
+    {
+      $$ = nil
+    }
+  | LIKE STRING
+    {
+      $$ = &ShowFilter{Like:string($2)}
+    }
 
 show_session_or_global:
   /* empty */
@@ -2058,6 +2100,12 @@ table_name:
     $$ = TableName{Qualifier: $1, Name: $3}
   }
 
+delete_table_name:
+table_id '.' '*'
+  {
+    $$ = TableName{Name: $1}
+  }
+
 index_hint_list:
   {
     $$ = nil
@@ -2450,23 +2498,7 @@ function_call_keyword:
   {
     $$ = &ConvertUsingExpr{Expr: $3, Type: $5}
   }
-| SUBSTR openb column_name ',' value_expression closeb
-  {
-    $$ = &SubstrExpr{Name: $3, From: $5, To: nil}
-  }
-| SUBSTR openb column_name ',' value_expression ',' value_expression closeb
-  {
-    $$ = &SubstrExpr{Name: $3, From: $5, To: $7}
-  }
 | SUBSTR openb column_name FROM value_expression FOR value_expression closeb
-  {
-    $$ = &SubstrExpr{Name: $3, From: $5, To: $7}
-  }
-| SUBSTRING openb column_name ',' value_expression closeb
-  {
-    $$ = &SubstrExpr{Name: $3, From: $5, To: nil}
-  }
-| SUBSTRING openb column_name ',' value_expression ',' value_expression closeb
   {
     $$ = &SubstrExpr{Name: $3, From: $5, To: $7}
   }
@@ -2474,23 +2506,7 @@ function_call_keyword:
   {
     $$ = &SubstrExpr{Name: $3, From: $5, To: $7}
   }
-| SUBSTR openb STRING ',' value_expression closeb
-  {
-    $$ = &SubstrExpr{StrVal: NewStrVal($3), From: $5, To: nil}
-  }
-| SUBSTR openb STRING ',' value_expression ',' value_expression closeb
-  {
-    $$ = &SubstrExpr{StrVal: NewStrVal($3), From: $5, To: $7}
-  }
 | SUBSTR openb STRING FROM value_expression FOR value_expression closeb
-  {
-    $$ = &SubstrExpr{StrVal: NewStrVal($3), From: $5, To: $7}
-  }
-| SUBSTRING openb STRING ',' value_expression closeb
-  {
-    $$ = &SubstrExpr{StrVal: NewStrVal($3), From: $5, To: nil}
-  }
-| SUBSTRING openb STRING ',' value_expression ',' value_expression closeb
   {
     $$ = &SubstrExpr{StrVal: NewStrVal($3), From: $5, To: $7}
   }
@@ -2625,6 +2641,14 @@ function_call_conflict:
 | REPLACE openb select_expression_list closeb
   {
     $$ = &FuncExpr{Name: NewColIdent("replace"), Exprs: $3}
+  }
+| SUBSTR openb select_expression_list closeb
+  {
+    $$ = &FuncExpr{Name: NewColIdent("substr"), Exprs: $3}
+  }
+| SUBSTRING openb select_expression_list closeb
+  {
+    $$ = &FuncExpr{Name: NewColIdent("substr"), Exprs: $3}
   }
 
 match_option:
@@ -3301,6 +3325,7 @@ non_reserved_keyword:
 | CHAR
 | CHARACTER
 | CHARSET
+| CHECK
 | COLLATION
 | COLUMNS
 | COMMENT_KEYWORD
@@ -3364,6 +3389,7 @@ non_reserved_keyword:
 | REPEATABLE
 | RESTRICT
 | ROLLBACK
+| SEQUENCE
 | SESSION
 | SERIALIZABLE
 | SHARE
@@ -3392,12 +3418,8 @@ non_reserved_keyword:
 | VIEW
 | VINDEX
 | VINDEXES
-| VITESS_KEYSPACES
-| VITESS_SHARDS
-| VITESS_TABLETS
+| VITESS_METADATA
 | VSCHEMA
-| VSCHEMA_TABLES
-| VITESS_TARGET
 | WARNINGS
 | WITH
 | WRITE

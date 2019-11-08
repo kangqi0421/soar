@@ -20,6 +20,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -37,6 +39,10 @@ var rEnv *database.Connector
 
 func TestMain(m *testing.M) {
 	// 初始化 init
+	if common.DevPath == "" {
+		_, file, _, _ := runtime.Caller(0)
+		common.DevPath, _ = filepath.Abs(filepath.Dir(filepath.Join(file, ".."+string(filepath.Separator))))
+	}
 	common.BaseDir = common.DevPath
 	err := common.ParseConfig("")
 	common.LogIfError(err, "init ParseConfig")
@@ -83,11 +89,13 @@ func TestRuleImplicitConversion(t *testing.T) {
 			"SELECT * FROM t1, t3 WHERE t1.title = t3.title;",
 			"SELECT * FROM t1 WHERE title in (60, '60');",
 			"SELECT * FROM t1 WHERE title in (60);",
+			"SELECT * FROM t1 WHERE title in (60, 60);",
 			"SELECT * FROM t4 WHERE col = '1'",
 		},
 		{
 			// https://github.com/XiaoMi/soar/issues/151
 			"SELECT * FROM t4 WHERE col = 1",
+			"SELECT * FROM sakila.film WHERE rental_rate > 1",
 		},
 	}
 	for _, sql := range sqls[0] {
